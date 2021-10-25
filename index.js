@@ -174,11 +174,11 @@ async function start() {
     exportingProperties = ['dependencies', 'devDependencies']
   }
 
-  const jsonContent = readRootPackageJson(rootFolderPath)
+  const projectContent = readRootPackageJson(rootFolderPath)
 
   for (let i = 0; i < exportingProperties.length; i++) {
     const key = exportingProperties[i]
-    await writePropertiesToFile(rootFolderPath, jsonContent[key], path.join(exportFolderPath, `${key}.csv`))
+    await writePropertiesToFile(rootFolderPath, projectContent[key], path.join(exportFolderPath, `${projectContent.name}-${key}.csv`))
   }
 }
 
