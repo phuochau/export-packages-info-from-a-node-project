@@ -3,24 +3,36 @@ const _ = require('lodash')
 const path = require('path')
 const fs = require('fs')
 const inquirer = require('inquirer')
-const axios = require('axios')
+const Axios = require('axios')
+const moment = require('moment')
 const createCsvWriter = require('csv-writer').createObjectCsvWriter;
-const { convert } = require('html-to-text');
 
+const axios = Axios.create({
+  baseURL: 'https://api.github.com/',
+  headers: {
+    Accept: 'application/vnd.github.v3+json',
+    'Authorization': `token ${process.env.GITHUB_PERSONAL_TOKEN}` 
+  }
+})
 
 const OPTION_DEPENDENCIES = 'Only dependencies'
 const OPTION_DEV_DEPENDENCIES = 'Only devDependencies'
 const OPTION_BOTH = 'Both'
+const YEAR_VARS = ['[yyyy]', '[year]']
+const OWNER_VARS = ['[name of copyright owner]', '[fullname]']
+
+function replaceVarByValue(origin, searches, newString) {
+  let final = origin
+  for (let i = 0; i < searches.length; i++) {
+    final = final.replace(searches[i], newString)
+  }
+  return final
+}
 
 async function getLicenseLink(link, name = '') {
   try {
     link = link || `https://api.github.com/licenses/${name.toLowerCase()}`
-    const res = await axios.get(link, {
-      headers: {
-        Accept: 'application/vnd.github.v3+json',
-        'Authorization': `token ${process.env.GITHUB_PERSONAL_TOKEN}` 
-      }
-    })
+    const res = await axios.get(link)
 
     return _.get(res, 'data.html_url')
   } catch (e) {
@@ -63,12 +75,50 @@ async function findGithubLink(packageInfo, packageName) {
 }
 
 function getRepoInfo(uri) {
-  return axios.get(`https://api.github.com/repos/${uri}`, {
-    headers: {
-      Accept: 'application/vnd.github.v3+json',
-      'Authorization': `token ${process.env.GITHUB_PERSONAL_TOKEN}` 
+  return axios.get(`repos/${uri}`).then(res => res.data)
+}
+
+function getUserInfo(username) {
+  return axios.get(`users/${username}`).then(res => res.data)
+}
+
+function getLicenseInfo(licenseId) {
+  return axios.get(`licenses/${licenseId}`).then(res => res.data)
+}
+
+async function getLicenseDescription(licenseInfo, repoInfo) {
+  // Fetch from LICENSE file at the root of repository or build the content by https://choosealicense.com/
+  let licenseDescription = null
+  try {
+    let repoLicenseFileContent = await axios.get(`repos/${_.get(repoInfo, 'full_name')}/contents/LICENSE`).then(res => res.data)
+    if (repoLicenseFileContent) {
+      repoLicenseFileContent = await Axios.get(repoLicenseFileContent.download_url).then(res => res.data)
+      if (repoLicenseFileContent) {
+        licenseDescription = repoLicenseFileContent
+      }
     }
-  })
+  } catch (e) {
+  }
+
+  if (!licenseDescription) {
+    licenseDescription = _.get(licenseInfo, 'body')
+
+    const createdYear = moment(_.get(repoInfo, 'created_at'), '').year()
+    const authorUsername = _.get(repoInfo, 'owner.login')
+    const authorInfo = await getUserInfo(authorUsername)
+    const authorName = _.get(authorInfo, 'name') || authorUsername
+    
+    // replace by year and full name
+    licenseDescription = replaceVarByValue(licenseDescription, YEAR_VARS, createdYear.toString())
+    licenseDescription = replaceVarByValue(licenseDescription, OWNER_VARS, authorName)
+  }
+  // beautify the description
+  licenseDescription = licenseDescription.replace(/\n\n/g, '<br>')
+  licenseDescription = licenseDescription.replace(/\n/g, ' ')
+  licenseDescription = licenseDescription.replace(/<br>/g, '\n\n')
+  licenseDescription = licenseDescription.trim()
+
+  return licenseDescription
 }
 
 function readModulePackageJson(rootFolderPath, packageName) {
@@ -80,7 +130,7 @@ function readModulePackageJson(rootFolderPath, packageName) {
 async function writePropertiesToFile(rootFolderPath, dependencies, exportPath) {
   try {
     const csvWriter = createCsvWriter({
-      path: exportPath,
+      path: `${exportPath}.csv`,
       header: [
         {id: 'no', title: 'No'},
         {id: 'name', title: 'Name'},
@@ -97,15 +147,22 @@ async function writePropertiesToFile(rootFolderPath, dependencies, exportPath) {
       const name = key
       const version = dependencies[key]
       const packageInfo = readModulePackageJson(rootFolderPath, name)
+      const repoLink = await findGithubLink(packageInfo, name)
+
+      let repoInfo = null
+      let licenseInfo = null
+      let licenseKey = ''
       let licenseName = packageInfo.license
       let licenseLink = ''
-
-      const repoLink = await findGithubLink(packageInfo, name)
-      let info = null
+      let licenseDescription = ''
       try {
-        info = await getRepoInfo(repoLink)
-        licenseName = _.get(info, 'data.license.name', '') || packageInfo.license
-        licenseLink = await getLicenseLink(_.get(info, 'data.license.url', ''), licenseName)
+        repoInfo = await getRepoInfo(repoLink)
+        // License
+        licenseKey = _.get(repoInfo, 'license.key', '')
+        licenseInfo = await getLicenseInfo(licenseKey)
+        licenseName = _.get(repoInfo, 'license.name', '') || packageInfo.license
+        licenseLink = await getLicenseLink(_.get(repoInfo, 'license.url', ''), licenseName)
+        licenseDescription = await getLicenseDescription(licenseInfo, repoInfo)
       } catch (e) {
         console.log("Can't fetch package info from:", repoLink)
         console.log(_.get(e, 'response', e.message))
@@ -118,13 +175,15 @@ async function writePropertiesToFile(rootFolderPath, dependencies, exportPath) {
         version,
         license_name: licenseName,
         license_link: licenseLink,
+        license_description: licenseDescription
       })
       i++
     }
-  
+
     csvWriter
       .writeRecords(data)
       .then(()=> console.log('The CSV file was written successfully'));
+    fs.writeFileSync(`${exportPath}.json`, JSON.stringify(data))
   } catch (e) {
     console.log(_.get(e, 'response', e.message))
   }
@@ -159,7 +218,7 @@ async function start() {
   const exportOption  = answers.exportOption
   const exportFolderPath = path.join(__dirname, 'output')
   if (!rootFolderPath) {
-    console.log('The path of root is empty.')
+    console.log('The root path is empty.')
     return
   }
 
@@ -170,7 +229,7 @@ async function start() {
   let exportingProperties = ['dependencies']
   if (exportOption === OPTION_DEV_DEPENDENCIES) {
     exportingProperties = ['devDependencies']
-  } else if (exportOption ===   OPTION_BOTH) {
+  } else if (exportOption === OPTION_BOTH) {
     exportingProperties = ['dependencies', 'devDependencies']
   }
 
@@ -178,7 +237,7 @@ async function start() {
 
   for (let i = 0; i < exportingProperties.length; i++) {
     const key = exportingProperties[i]
-    await writePropertiesToFile(rootFolderPath, projectContent[key], path.join(exportFolderPath, `${projectContent.name}-${key}.csv`))
+    await writePropertiesToFile(rootFolderPath, projectContent[key], path.join(exportFolderPath, `${projectContent.name}-${key}`))
   }
 }
 
